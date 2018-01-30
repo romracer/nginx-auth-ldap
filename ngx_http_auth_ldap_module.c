@@ -30,12 +30,12 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 #include <ngx_md5.h>
+#include <arpa/inet.h>
 #include <ldap.h>
+#if (NGX_OPENSSL)
 #include <openssl/opensslv.h>
+#endif
 
-// used for manual warnings
-#define XSTR(x) STR(x)
-#define STR(x) #x
 // make sure manual warnings don't get escalated to errors
 #ifdef __clang__
 #pragma clang diagnostic warning "-W#warnings"
@@ -430,14 +430,14 @@ ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
         }
         server->connections = i;
     } else if (ngx_strcmp(value[0].data, "ssl_check_cert") == 0  && ngx_strcmp(value[1].data, "on") == 0) {
-      #if OPENSSL_VERSION_NUMBER >= 0x10002000
+      #ifdef X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT
       server->ssl_check_cert = 1;
       #else
-      #warning "http_auth_ldap: Compiling with OpenSSL < 1.0.2, certificate verification will be unavailable. OPENSSL_VERSION_NUMBER == " XSTR(OPENSSL_VERSION_NUMBER)
+      #warning "http_auth_ldap: Compiling with older SSL library, certificate verification will be unavailable."
       ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
         "http_auth_ldap: 'ssl_cert_check': cannot verify remote certificate's domain name because "
         "your version of OpenSSL is too old. "
-        "Please install OpenSSL >= 1.02 and recompile nginx.");
+        "Please install OpenSSL >= 1.0.2 and recompile nginx.");
       #endif
     } else if (ngx_strcmp(value[0].data, "ssl_ca_dir") == 0) {
       server->ssl_ca_dir = value[1];
@@ -653,7 +653,7 @@ ngx_http_auth_ldap_parse_require(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *se
     ngx_http_compile_complex_value_t ccv;
 
     value = cf->args->elts;
-    ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0, "http_auth_ldap: parse_require");
+    ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0, "http_auth_ldap: parse_require");
 
     if (ngx_strcmp(value[1].data, "valid_user") == 0) {
         server->require_valid_user = 1;
@@ -665,6 +665,7 @@ ngx_http_auth_ldap_parse_require(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *se
         }
         target = &server->require_valid_user_dn;
     } else if (ngx_strcmp(value[1].data, "user") == 0) {
+        ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0, "http_auth_ldap: Setting user");
         if (server->require_user == NULL) {
             server->require_user = ngx_array_create(cf->pool, 4, sizeof(ngx_http_complex_value_t));
             if (server->require_user == NULL) {
@@ -673,7 +674,7 @@ ngx_http_auth_ldap_parse_require(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *se
         }
         target = ngx_array_push(server->require_user);
     } else if (ngx_strcmp(value[1].data, "group") == 0) {
-        ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0, "http_auth_ldap: Setting group");
+        ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0, "http_auth_ldap: Setting group");
         if (server->require_group == NULL) {
             server->require_group = ngx_array_create(cf->pool, 4, sizeof(ngx_http_complex_value_t));
             if (server->require_group == NULL) {
@@ -708,7 +709,7 @@ ngx_http_auth_ldap_parse_satisfy(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *se
     value = cf->args->elts;
 
     if (ngx_strcmp(value[1].data, "all") == 0) {
-        ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0, "http_auth_ldap: Setting satisfy all");
+        ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0, "http_auth_ldap: Setting satisfy all");
         server->satisfy_all = 1;
         return NGX_CONF_OK;
     }
@@ -1324,41 +1325,72 @@ ngx_http_auth_ldap_ssl_handshake_handler(ngx_connection_t *conn, ngx_flag_t vali
     c = conn->data;
 
     if (conn->ssl->handshaked) {
-        #if OPENSSL_VERSION_NUMBER >= 0x10002000
+        #ifdef X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT
         if (validate) { // verify remote certificate if requested
           X509 *cert = SSL_get_peer_certificate(conn->ssl->connection);
-          long chain_verified = SSL_get_verify_result(conn->ssl->connection);
-
-          int addr_verified;
-          char *hostname = c->server->ludpp->lud_host;
-          addr_verified = X509_check_host(cert, hostname, 0, 0, 0);
-
-          if (!addr_verified) { // domain not in cert? try IP
-            size_t len; // get IP length
-            if (conn->sockaddr->sa_family == 4) len = 4;
-            else if (conn->sockaddr->sa_family == 6) len = 16;
-            else { // very unlikely indeed
-              ngx_http_auth_ldap_close_connection(c);
-              return;
-            }
-            addr_verified = X509_check_ip(cert, (const unsigned char*)conn->sockaddr->sa_data, len, 0);
+          if (cert == NULL) {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+              "http_auth_ldap: Remote side did not present an SSL certificate");
+            ngx_http_auth_ldap_close_connection(c);
+            return;
           }
 
+          char *hostname = c->server->ludpp->lud_host;
+          int addr_verified = X509_check_host(cert, hostname, strlen(hostname), 0, NULL);
+          if (addr_verified < 0) {
+              ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                "http_auth_ldap: internal error in X509_check_host()");
+          }
+
+          if (addr_verified != 1 && conn->socklen) { // domain not in cert? try IP
+            char *addr = NULL; // get IP address
+
+            if (conn->sockaddr->sa_family == AF_INET) {
+              struct sockaddr_in *addr_in = (struct sockaddr_in *)conn->sockaddr;
+              addr = ngx_calloc(INET_ADDRSTRLEN, c->log);
+              inet_ntop(AF_INET, &(addr_in->sin_addr), addr, INET_ADDRSTRLEN);
+#if (NGX_HAVE_INET6)
+            } else if (conn->sockaddr->sa_family == AF_INET6) {
+              struct sockaddr_in6 *addr_in6 = (struct sockaddr_in6 *)conn->sockaddr;
+              addr = ngx_calloc(INET6_ADDRSTRLEN, c->log);
+              inet_ntop(AF_INET6, &(addr_in6->sin6_addr), addr, INET6_ADDRSTRLEN);
+#endif
+            } else { // very unlikely indeed
+              ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                "http_auth_ldap: Invalid connection protocol to remote side");
+              ngx_http_auth_ldap_close_connection(c);
+              X509_free(cert);
+              return;
+            }
+
+            addr_verified = X509_check_ip_asc(cert, addr, 0);
+            if (addr_verified < 0) {
+              ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                "http_auth_ldap: internal error in X509_check_ip_asc()");
+            }
+            free(addr);
+          }
+
+          long chain_verified = SSL_get_verify_result(conn->ssl->connection);
+
           // Find anything fishy?
-          if ( !(cert && addr_verified && chain_verified == X509_V_OK) ) {
-            if (!addr_verified) {
+          if ( !(addr_verified == 1 && chain_verified == X509_V_OK) ) {
+            if (addr_verified != 1) {
               ngx_log_error(NGX_LOG_ERR, c->log, 0,
                 "http_auth_ldap: Remote side presented invalid SSL certificate: "
                 "does not match address (neither server's domain nor IP in certificate's CN or SAN)");
-                fprintf(stderr, "DEBUG: SSL cert domain mismatch\n"); fflush(stderr);
             } else {
               ngx_log_error(NGX_LOG_ERR, c->log, 0,
                 "http_auth_ldap: Remote side presented invalid SSL certificate: error %l, %s",
                 chain_verified, X509_verify_cert_error_string(chain_verified));
             }
             ngx_http_auth_ldap_close_connection(c);
+            X509_free(cert);
             return;
           }
+
+          // free our cert if we made it this far
+          X509_free(cert);
         }
         #endif
 
@@ -1404,7 +1436,7 @@ ngx_http_auth_ldap_ssl_handshake(ngx_http_auth_ldap_connection_t *c)
     if (c->server->ssl_check_cert) {
       // load CA certificates: custom ones if specified, default ones instead
       if (c->server->ssl_ca_file.data || c->server->ssl_ca_dir.data) {
-#if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
+#if (OPENSSL_VERSION_NUMBER >= 0x10100000L) && !defined(LIBRESSL_VERSION_NUMBER)
         int setcode = SSL_CTX_load_verify_locations(transport->ssl->session_ctx,
           (char*)(c->server->ssl_ca_file.data), (char*)(c->server->ssl_ca_dir.data));
 #else
@@ -1419,7 +1451,7 @@ ngx_http_auth_ldap_ssl_handshake(ngx_http_auth_ldap_connection_t *c)
             "Error: %lu, %s", error_code, error_msg);
         }
       }
-#if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
+#if (OPENSSL_VERSION_NUMBER >= 0x10100000L) && !defined(LIBRESSL_VERSION_NUMBER)
       int setcode = SSL_CTX_set_default_verify_paths(transport->ssl->session_ctx);
 #else
       int setcode = SSL_CTX_set_default_verify_paths(transport->ssl->connection->ctx);
