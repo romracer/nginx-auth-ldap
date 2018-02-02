@@ -1679,7 +1679,13 @@ ngx_http_auth_ldap_connect(ngx_http_auth_ldap_connection_t *c)
     ngx_addr_t *addr;
     ngx_int_t rc;
 
-    addr = &c->server->parsed_url.addrs[ngx_random() % c->server->parsed_url.naddrs];
+    if (c->server->parsed_url.naddrs > 0)
+        addr = &c->server->parsed_url.addrs[ngx_random() % c->server->parsed_url.naddrs];
+    else {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0, "http_auth_ldap: Unable to find LDAP server to connect.");
+        ngx_add_timer(&c->reconnect_event, c->server->reconnect_timeout);
+        return;
+    }
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "http_auth_ldap: Connecting to LDAP server \"%V\".",
         &addr->name);
